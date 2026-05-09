@@ -1190,6 +1190,7 @@ private:
     friend class RegisterFile;
     friend class Debugger;
     friend class BreakpointUnit;
+    friend void DebugMon_Handler();
     #endif
 };
 
