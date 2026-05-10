@@ -53,6 +53,10 @@ MEMORY
     ram(wx) : ORIGIN = 0x20000200, LENGTH = 128K-0x200
 }
 
+_flash_origin = ORIGIN(flash);
+_flash_length = LENGTH(flash);
+_flash_erasesize = 0x4000;
+
 /* now define the output sections  */
 SECTIONS
 {
