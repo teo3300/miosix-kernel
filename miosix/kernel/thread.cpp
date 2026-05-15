@@ -863,7 +863,8 @@ bool Thread::IRQreportFault(const FaultData& fault)
     if (proc == Debugger::attached.process) {
         // Report fault reason to the debugger, hex code meaning is encoded in
         // enum FaultType
-        Debugger::attached.IRQstop(cur, StopReason::FAULT, fault.id);
+        Debugger::attached.IRQset(cur, StopReason::FAULT, fault.id);
+        Debugger::attached.running = false;
         // Need to disable debug hardware, otherwise stepping on a faulty
         // instruction would cause a debugevent in kernelspace, which is not
         // allowed.
@@ -1303,10 +1304,6 @@ void Thread::ThreadFlags::IRQsetDebugWait(Thread *self)
 {
     flags |= WAIT_DEBUG;
     Scheduler::IRQwaitStatusHook(self);
-}
-void Thread::ThreadFlags::unsafe_setDebugWait()
-{
-    flags |= WAIT_DEBUG;
 }
 
 void Thread::ThreadFlags::IRQclearDebugWait(Thread *self)
