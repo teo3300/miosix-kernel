@@ -40,6 +40,7 @@
 #include "interfaces_private/os_timer.h"
 #include "interfaces_private/sleep.h"
 #include "interfaces_private/smp.h"
+#include "debugger/debugger.h"
 #include "timeconversion.h"
 #include "pthread_private.h"
 #include <stdexcept>
@@ -470,6 +471,33 @@ void Thread::IRQwakeup()
         IRQinvokeScheduler();
 }
 
+#ifdef PROCESS_DEBUGGER
+// This function can only be called from within DebugMon_handle, after acquiring
+// a global lock
+void Thread::IRQdebugWait()
+{
+    Thread *cur=const_cast<Thread*>(runningThreads[getCurrentCoreId()]);
+    cur->flags.IRQsetDebugWait(cur);
+    IRQinvokeScheduler();
+}
+
+void Thread::debugWakeup()
+{
+    //pausing the kernel is not enough because of IRQwait and IRQwakeup
+    FastGlobalIrqLock lock;
+    IRQdebugWakeup();
+}
+
+void Thread::IRQdebugWakeup()
+{
+    this->flags.IRQclearDebugWait(this);
+    // Heuristic load balancing: threads waking from I/O get preferentially
+    // allocated to lower core numbers
+    if(IRQconsiderRescheduling<Hlb::FromFirst>(this,getCurrentCoreId()))
+        IRQinvokeScheduler();
+}
+#endif
+
 Thread *Thread::getCurrentThread()
 {
     //Need to add lock if SMP, see comment in Thread::IRQgetCurrentThread()
@@ -770,12 +798,29 @@ void Thread::IRQhandleSvc()
             cur->flags.IRQsetUserspace(true);
             ::ctxsave[coreId]=cur->userCtxsave;
             proc->mpu.IRQenable();
+            #ifdef PROCESS_DEBUGGER
+            // Thread switches to userspace: enable sync local debug hardware to
+            // Debugger status
+            if (proc == Debugger::attached.process)
+                BreakpointUnit::IRQsyncLocal(cur);
+            #endif
             break;
         default:
             //All other syscalls are handled by switching to kernelspace
             cur->flags.IRQsetUserspace(false);
             ::ctxsave[coreId]=cur->ctxsave;
             MPUConfiguration::IRQdisable();
+            #ifdef PROCESS_DEBUGGER
+            // If this thread is associated to the attached process: clear local
+            // debug hardware
+            if (proc == Debugger::attached.process) {
+                // If status ist step: Thread tried to stop over an svc
+                if (cur->debugStatus == DebugStatus::STEP)
+                    cur->debugStatus  = DebugStatus::PEND;
+                // Disable BPU for the duration of svc
+                BreakpointUnit::IRQdisableLocal();
+            }
+            #endif
             break;
     }
 }
@@ -792,6 +837,24 @@ bool Thread::IRQreportFault(const FaultData& fault)
     //Switch to kernel mode
     cur->flags.IRQsetUserspace(false);
     ::ctxsave[getCurrentCoreId()]=cur->ctxsave;
+    #ifdef PROCESS_DEBUGGER
+    // Notify debugger that a fault happened
+    if (proc == Debugger::attached.process) {
+        // Report fault reason to the debugger, hex code meaning is encoded in
+        // enum FaultType
+        Debugger::attached.IRQset(cur, StopReason::FAULT, fault.id);
+        Debugger::attached.running = false;
+        // Need to disable debug hardware, otherwise stepping on a faulty
+        // instruction would cause a debugevent in kernelspace, which is not
+        // allowed.
+        // This is only needed explicitly here, as proc->ker context switch and
+        // resched are handled already
+        BreakpointUnit::IRQdisableLocal();
+        // There is no need to pause this thread, it's being destroyed, just
+        // wakeup debugger
+        if (Debugger::thread) Debugger::thread->IRQwakeup();
+    }
+    #endif
     MPUConfiguration::IRQdisable();
     return true;
 }
@@ -1214,5 +1277,21 @@ void Thread::ThreadFlags::IRQsetDeleted(Thread *self)
     flags |= DELETED;
     Scheduler::IRQwaitStatusHook(self);
 }
+
+#ifdef PROCESS_DEBUGGER
+void Thread::ThreadFlags::IRQsetDebugWait(Thread *self)
+{
+    flags |= WAIT_DEBUG;
+    Scheduler::IRQwaitStatusHook(self);
+}
+
+void Thread::ThreadFlags::IRQclearDebugWait(Thread *self)
+{
+    bool wasReady=isReady();
+    flags &= ~WAIT_DEBUG;
+    if(wasReady==false && isReady()) Scheduler::IRQwokenThread(self);
+    Scheduler::IRQwaitStatusHook(self);
+}
+#endif
 
 } //namespace miosix

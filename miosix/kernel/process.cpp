@@ -39,11 +39,13 @@
 #include <limits.h>
 #include <spawn.h>
 
+#include "thread.h"
 #include "sync.h"
 #include "process_pool.h"
 #include "process.h"
 #include "interfaces/cpu_const.h"
 #include "interfaces_private/userspace.h"
+#include "debugger/debugger.h"
 
 using namespace std;
 
@@ -186,6 +188,19 @@ pid_t Process::create(ElfProgram&& program, ArgsBlock&& args)
         parent->childs.remove(proc.get());
         throw bad_alloc(); //Thread allocation failed
     }
+    #ifdef PROCESS_DEBUGGER
+    // Make sure to set the proper thread as the attached one
+    if (Thread::getCurrentThread() == Debugger::thread) {
+        FastGlobalIrqLock dLock;
+        Debugger::attached.process = reinterpret_cast<Process*>(thr->getProcess());
+        Debugger::attached.running = true;
+        // The process is now running, it needs to step into debugmonitor as
+        // soon as it enters userspace
+        thr->debugStatus = DebugStatus::STEP;
+        proc->priv = true;
+    }
+    #endif
+
     //Cannot throw bad_alloc due to the reserve in Process's constructor.
     //This ensures we will never be in the uncomfortable situation where a
     //thread has already been created but there's no memory to list it
@@ -812,6 +827,23 @@ Process::SvcResult Process::handleSvc(SyscallParameters sp)
             case Syscall::EXIT:
             {
                 exitCode=(sp.getParameter(0) & 0xff)<<8;
+                #ifdef PROCESS_DEBUGGER
+                {
+                    FastGlobalIrqLock dLock;
+                    // TODO: maybe move if outside
+                    if (this == Debugger::attached.process) {
+                        // TODO: determine current thread
+                        Debugger::attached.IRQset(Thread::IRQgetCurrentThread(),
+                                StopReason::EXIT, exitCode >> 8);
+                        // On exit all threads exit
+                        Debugger::attached.running = false;
+                        // No need to disable debug hardware: the process left
+                        // kernelspace a while ago, context switch disabled
+                        // debug hardware already
+                        if (Debugger::thread) Debugger::thread->IRQwakeup();
+                    }
+                }
+                #endif
                 return Exit;
             }
 
@@ -830,7 +862,7 @@ Process::SvcResult Process::handleSvc(SyscallParameters sp)
                         ElfProgram program(path);
                         if(program.errorCode()==0)
                         {
-                            try {
+                           try {
                                 //TODO: when threads within processes are
                                 //implemented, kill all other threads
                                 load(std::move(program),std::move(args));
@@ -845,6 +877,21 @@ Process::SvcResult Process::handleSvc(SyscallParameters sp)
                                 //segfault here
                                 return Segfault;
                             }
+
+                            // Execve must be handled AFTER load
+                            #ifdef PROCESS_DEBUGGER
+                            if (this == Debugger::attached.process) {
+                                FastGlobalIrqLock dLock;
+                                    Debugger::attached.name = path;
+                                    // TODO: determine current thread
+                                    Debugger::attached.IRQset(Thread::IRQgetCurrentThread(),
+                                        StopReason::EXECVE, 0);
+                                    // On execve, whole process is substituted
+                                    Debugger::attached.running = false;
+                                    if (Debugger::thread) Debugger::thread->IRQwakeup();
+                            }
+                            #endif
+
                             return Execve;
                         } else sp.setParameter(0,program.errorCode());
                     } else sp.setParameter(0,-E2BIG);
@@ -979,6 +1026,24 @@ Process::SvcResult Process::handleSvc(SyscallParameters sp)
     }
     return Resume;
 }
+
+#ifdef PROCESS_DEBUGGER
+// FIXME: Ugly semi static function
+Process* Process::debugGetByPid(pid_t pid) const {
+    // pid 0 is reservd to kernel, never try to search for it
+    if (pid == 0) return nullptr;
+    auto& processTable = ProcessTable::instance();
+    {
+        Lock<KernelMutex> l(processTable.procMutex);
+        const auto p = processTable.processes.find(pid);
+        if(p == processTable.processes.end()) return nullptr;
+        // Safe cast since a pid != 0 is return
+        const auto proc = reinterpret_cast<Process*>(p->second);
+        if(proc->zombie) return nullptr;
+        return proc;
+    }
+}
+#endif //PROCESS_DEBUGGER
 
 //
 // class ArgsBlock

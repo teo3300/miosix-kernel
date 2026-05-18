@@ -26,6 +26,7 @@
  ***************************************************************************/
 
 #include "elf_program.h"
+#include "debugger/debugger.h"
 #include "process.h"
 #include "process_pool.h"
 #include "filesystem/file_access.h"
@@ -34,6 +35,7 @@
 #include <cstring>
 #include <cstdio>
 #include <memory>
+#include <sys/types.h>
 
 using namespace std;
 
@@ -93,13 +95,23 @@ private:
          * \param elf pointer to the program RAM allocated memory region
          * \param size memory region size
          */
+        #ifdef PROCESS_DEBUGGER
+        Entry(ino_t inode, dev_t device, unsigned int *elf, unsigned int size, bool priv)
+            : inode(inode), device(device), elf(elf), size(size), useCount(1),
+              priv(priv) {}
+        #else //PROCESS_DEBUGGER
         Entry(ino_t inode, dev_t device, unsigned int *elf, unsigned int size)
             : inode(inode), device(device), elf(elf), size(size), useCount(1) {}
+        #endif //PROCESS_DEBUGGER
         ino_t inode;
         dev_t device;
         unsigned int *elf;
         unsigned int size;
         int useCount; ///< Used for reference counting the cache entry
+        #ifdef PROCESS_DEBUGGER
+        // If this flag is set, force duplication of code section
+        const bool priv;
+        #endif //PROCESS_DEBUGGER
     };
 
     static KernelMutex m; ///< Protect programs against concurrent accesses
@@ -139,22 +151,45 @@ int ProgramCache::load(const char *name, const unsigned int *& elf,
     struct stat s;
     if(file->fstat(&s)) return -EFAULT;
     Lock<KernelMutex> l(m);
-    //I know, lookup is O(n), but we need to index the cache by <inode,dev>
-    //when loading, and index it by pointer when unloading, while also caring
-    //about code size. On top of that, we don't expect many loaded programs
-    //and spawning a process is already a heavy operation so this won't be
-    //the bottleneck anyway
-    for(auto& p : programs)
+    #ifdef PROCESS_DEBUGGER
+    // If the program load is being done by the debugger thread (if the debugger
+    // is attempting a process_spawn) do not use cache, since the debugger might
+    // be using software breakpoints and they would be shared across all
+    // programs sharing the same text section, two checks must be performed:
+    // - If the process being spawned is the attaced one, skip the cache
+    //   checking phase, forcing it to have its own text section
+    // - Prevent attempts at copying this section in the future
+    // - Additonally: restore normal functioning once the debugged thread stops
+    //   execution
+    //
+    //   KernelMutex m:
+    const auto makePrivate (Thread::getCurrentThread() == Debugger::thread);
+    if (!makePrivate) {
+    #else //PROCESS_DEBUGGER
+    // To avoid repeated ifdef guards
     {
-        if(p.inode!=s.st_ino || p.device!=s.st_dev) continue;
-        //Found, increment use count and return
-        p.useCount++;
-        elf=p.elf;
-        size=p.size;
-        needUnload=true;
-        DBG("ProgramCache::load(%s): found %p in cache use count %d\n",
-            name,elf,p.useCount);
-        return 0;
+    #endif //PROCESS_DEBUGGER
+        //I know, lookup is O(n), but we need to index the cache by <inode,dev>
+        //when loading, and index it by pointer when unloading, while also caring
+        //about code size. On top of that, we don't expect many loaded programs
+        //and spawning a process is already a heavy operation so this won't be
+        //the bottleneck anyway
+        for(auto& p : programs)
+        {
+            if(p.inode!=s.st_ino || p.device!=s.st_dev) continue;
+            #ifdef PROCESS_DEBUGGER
+            // If the section is marked private do not share it
+            if(p.priv) continue;
+            #endif //PROCESS_DEBUGGER
+            //Found, increment use count and return
+            p.useCount++;
+            elf=p.elf;
+            size=p.size;
+            needUnload=true;
+            DBG("ProgramCache::load(%s): found %p in cache use count %d\n",
+                name,elf,p.useCount);
+            return 0;
+        }
     }
     //Not found, load program in cache
     off_t fileSize=s.st_size;
@@ -173,7 +208,11 @@ int ProgramCache::load(const char *name, const unsigned int *& elf,
     //Zero the eventual slack size
     memset(reinterpret_cast<unsigned char*>(ramPointer)+fileSize,0,ramSize-fileSize);
     //Success
+    #ifdef PROCESS_DEBUGGER
+    programs.push_front(Entry(s.st_ino,s.st_dev,ramPointer,ramSize,makePrivate));
+    #else
     programs.push_front(Entry(s.st_ino,s.st_dev,ramPointer,ramSize));
+    #endif
     elf=ramPointer;
     size=ramSize;
     needUnload=true;

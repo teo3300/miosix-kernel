@@ -38,6 +38,7 @@
 #include "interfaces/arch_registers.h"
 #include "interfaces/interrupts.h"
 #include "interfaces_private/smp.h"
+#include "debugger/debugger.h"
 
 #ifndef __CORTEX_M
 #error "__CORTEX_M undefined"
@@ -714,14 +715,85 @@ void UsageFault_Handler()
     IRQsystemReboot();
 }
 
+#ifdef PROCESS_DEBUGGER
+void IRQdebugMonFail() {
+    #ifdef WITH_ERRLOG
+    IRQerrorLog("\r\n*** Thread: ");
+    printUnsignedInt(reinterpret_cast<unsigned int>(Thread::IRQgetCurrentThread()));
+    IRQerrorLog("*** DFSR:   ");
+    printUnsignedInt(SCB->DFSR & 0b11111);
+    IRQerrorLog("*** Unexpected DebugMon @ ");
+    tryPrintingProgramCounter();
+    #endif //WITH_ERRLOG
+    IRQsystemReboot();
+}
+#endif
+
 void DebugMon_Handler()
 {
     FastGlobalLockFromIrq lock;
+
+    #ifdef PROCESS_DEBUGGER
+
+    Thread *thread = Thread::IRQgetCurrentThread();
+
+    // Debug events can only happen in usermode
+    if (! thread->flags.isInUserspace()) {
+        IRQerrorLog("\r\n*** DebugMon event outside userspace: ");
+        IRQdebugMonFail();
+    }
+
+    const Process *process = static_cast<Process*>(thread->getProcess());
+
+    // Not attached process
+    if (process != Debugger::attached.process) {
+        IRQerrorLog("\r\n*** DebugMon in different process: ");
+        IRQdebugMonFail();
+    }
+
+    const unsigned int off = 24;
+    const unsigned int psp = __get_PSP();
+
+    extern char _process_pool_start asm("_process_pool_start");
+    extern char _process_pool_end   asm("_process_pool_end");
+
+    // Validate stack pointer
+    // FIXME: Does it include off & watermark?
+    if (psp<reinterpret_cast<unsigned int>(&_process_pool_start)
+     || psp>reinterpret_cast<unsigned int>(&_process_pool_end)-off-sizeof(unsigned int)) {
+        IRQerrorLog("\r\n*** Corrupted user stack pointer");
+        IRQdebugMonFail();
+    }
+    // Wakeup debugged thread
+    thread->IRQdebugWait();
+    // For multithreading: do this only when no more threads of the process are
+    // running
+    // Set running flag
+    // TODO: with the assumption of single-thread, the first thread hitting a
+    // breakpoint is the only one reporting the haltint reason, all other
+    // threads stop without reporting their halting reason
+    if (Debugger::attached.reason == StopReason::NONE) {
+        Debugger::attached.IRQset(thread, StopReason::DEBUGEVENT, 0);
+    }
+    // TODO: with the assumption of single-thread, process running is immediately
+    // set to false, With the support of multithread this must be set only by
+    // the last trhead which happens to stop, by either performing a context
+    // switch, a resched, or hitting another breakpoint
+    Debugger::attached.running = false;
+    // Wakeup debugger thread if waiting
+    if (Debugger::thread != nullptr) {
+        // Wakeup debugger if waiting
+        Debugger::thread->IRQwakeup();
+    }
+    // Clear dfsr
+    SCB->DFSR = 0b11111;
+    #else // PROCESS_DEBUGGER
     #ifdef WITH_ERRLOG
     IRQerrorLog("\r\n***Unexpected DebugMon @ ");
     tryPrintingProgramCounter();
     #endif //WITH_ERRLOG
     IRQsystemReboot();
+    #endif // PROCESS_DEBUGGER
 }
 
 #endif //__CORTEX_M != 0
