@@ -52,12 +52,11 @@ typedef enum : int {
     REGISTER_FILE_ENTRIES
 } RegisterName;
 
-
 #if __FPU_PRESENT == 1
     // includes float and fpscr
-    const int REGISTER_FILE_SIZE_BYTES = (17*4) + (16*8) + (1*4);
+    static const int REGISTER_FILE_SIZE_BYTES = (17*4) + (16*8) + (1*4);
 #else
-    const int REGISTER_FILE_SIZE_BYTES = (17*4);
+    static const int REGISTER_FILE_SIZE_BYTES = (17*4);
 #endif
 
 // Used to ensure the communication buffer is big enough to fit all packages
@@ -65,17 +64,20 @@ typedef enum : int {
 #if __FPU_PRESENT == 1
 // FPU present, biggest message is 'G'
 // 'G' + 2 character for each byte + '\n'
-const int MINIMUM_GDB_BUFFER_SIZE = 402;
+static const int MINIMUM_GDB_BUFFER_SIZE = 402;
 #else
 // FPU not present, biggest message is reply to 'qXfer:memory-map:read'
-const int MINIMUM_GDB_BUFFER_SIZE = 208;
+static const int MINIMUM_GDB_BUFFER_SIZE = 208;
 #endif
 
 #if __FPU_PRESENT == 1
-const int MAX_REGISTER_SIZE_BYTES = 8;
+static const int MAX_REGISTER_SIZE_BYTES = 8;
 #else
-const int MAX_REGISTER_SIZE_BYTES = 4;
+static const int MAX_REGISTER_SIZE_BYTES = 4;
 #endif
+
+// Holds the size of base registers, mostly to implement assertions
+static const int BASE_REGISTER_SIZE_BYTES = 4;
 ;
 
 extern const char targetXMLString[];

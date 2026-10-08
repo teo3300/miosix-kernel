@@ -230,7 +230,8 @@ enum class StopReason {
 class DebugEvent {
 public:
     StopReason reason = StopReason::NONE;
-    unsigned int code = 0;
+    unsigned char code = 0;
+    unsigned int pc = 0; // Only relevant with StopReason::FAULT
 
     inline void IRQclear() {
         this->reason = StopReason::NONE;
@@ -412,18 +413,7 @@ private:
     /**
      * @brief Waits for the attached process to enter debugstate
      */
-    inline void waitAttached() {
-        // TODO: multithreaded-processes debugger: need a method to wait on 
-        // attached.process->IRQdebugState(), in order to wait for all threads to stop,
-        // without relying on Process structure, which may be freed (e.g.: event == EXIT)
-        FastGlobalIrqLock dLock;
-        // While process is not in debugstate (at least one thread running)
-        while(attached.debugState == false) {
-            // TODO: to implement process kill, should peek one character from
-            // gdbserial if available, matching 0x03
-            Thread::IRQglobalIrqUnlockAndWait(dLock);
-        }
-    }
+    void waitAttachedAndReply();
 
     void vrun();
     void vattach();

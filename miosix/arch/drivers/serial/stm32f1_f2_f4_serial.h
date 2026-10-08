@@ -102,6 +102,12 @@ private:
     ssize_t readFromRxQueue(void *buffer, size_t size);
 
     /**
+     * Peek the available elements from rxqueue (used in nonblocking read)
+     */
+    // FIXME: proper integration and documentation
+    size_t peekFromRxQueue();
+
+    /**
      * Update if the line is idle or not from the value of the USART
      * status register.
      */
@@ -199,6 +205,13 @@ public:
      * \return number of bytes written or a negative number on failure
      */
     ssize_t writeBlock(const void *buffer, size_t size, off_t where);
+
+    /**
+     * Get the size of available data
+     * \param requested size for read
+     * \return number of available bytes to read
+     */
+    size_t peekSize(size_t size);
     
     /**
      * Write a string.
@@ -301,6 +314,13 @@ public:
      * \return number of bytes written or a negative number on failure
      */
     ssize_t writeBlock(const void *buffer, size_t size, off_t where);
+    
+    /**
+     * Get the size of available data
+     * \param requested size for read
+     * \return number of available bytes to read
+     */
+    size_t peekSize(size_t size);
     
     /**
      * Write a string.

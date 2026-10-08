@@ -326,6 +326,12 @@ ssize_t STM32SerialBase::readFromRxQueue(void *buffer, size_t size)
     return result;
 }
 
+size_t STM32SerialBase::peekFromRxQueue() {
+    Lock<KernelMutex> l(rxMutex);
+    DeepSleepLock dpLock;
+    return rxQueue.size();
+}
+
 void STM32SerialBase::rxWakeup()
 {
     if(rxWaiting)
@@ -396,6 +402,10 @@ void STM32Serial::commonInit(int id, int baudrate, GpioPin tx, GpioPin rx,
 ssize_t STM32Serial::readBlock(void *buffer, size_t size, off_t where)
 {
     return STM32SerialBase::readFromRxQueue(buffer, size);
+}
+
+size_t STM32Serial::peekSize(size_t size) {
+    return STM32SerialBase::peekFromRxQueue();
 }
 
 ssize_t STM32Serial::writeBlock(const void *buffer, size_t size, off_t where)
@@ -594,6 +604,10 @@ void STM32DmaSerial::waitDmaWriteEnd()
 ssize_t STM32DmaSerial::readBlock(void *buffer, size_t size, off_t where)
 {
     return STM32SerialBase::readFromRxQueue(buffer, size);
+}
+
+size_t STM32DmaSerial::peekSize(size_t size) {
+    return STM32SerialBase::peekFromRxQueue();
 }
 
 void STM32DmaSerial::IRQstartDmaRead()

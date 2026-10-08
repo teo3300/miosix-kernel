@@ -133,6 +133,16 @@ public:
     virtual ssize_t writeBlock(const void *buffer, size_t size, off_t where);
     
     /**
+     * Get the size of available data
+     * \param requested size for read
+     * \return number of available bytes to read
+     */
+    // TODO: Implemented only for STM32Serial and STM32DmaSerial, other classes
+    // use default implementation
+    // (returns size, doesn't allow non-blocking read)
+    virtual size_t peekSize(size_t size);
+    
+    /**
      * Write a string.
      * An extension to the Device interface that adds a new member function,
      * which is used by the kernel on console devices to write debug information

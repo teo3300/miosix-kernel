@@ -111,9 +111,8 @@ int RegisterFile::getSize(int i) {
                                     return 4;
 }
 
-// CTXSAVE_ON_STACK does not respect alignment, thus + 4
 // If alignment is not respected, gdb will fail to backtrace call frames
-static const unsigned int ctxSaveOnStackAligned = ((CTXSAVE_ON_STACK - 1) / CTXSAVE_STACK_ALIGNMENT + 1) * CTXSAVE_STACK_ALIGNMENT;
+const unsigned int ctxSaveOnStackAligned = (CTXSAVE_ON_STACK == 0) ? 0 : ((CTXSAVE_ON_STACK - 1) / CTXSAVE_STACK_ALIGNMENT + 1) * CTXSAVE_STACK_ALIGNMENT;
     static_assert(ctxSaveOnStackAligned % CTXSAVE_STACK_ALIGNMENT == 0,
             "ctxSaveOnStackAligned - does not respect stack alignment");
 

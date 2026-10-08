@@ -114,6 +114,14 @@ public:
      * case of errors
      */
     virtual int isatty() const;
+
+    /**
+     * Perform various operations on a file descriptor
+     * \param cmd specifies the operation to perform
+     * \param opt optional argument that some operation require
+     * \return the exact return value depends on CMD, -1 is returned on error
+     */
+    virtual int fcntl(int cmd, int opt);
     
     /**
      * Perform various operations on a file descriptor
@@ -131,6 +139,7 @@ private:
 ssize_t DevFsFile::write(const void *data, size_t len)
 {
     if((flags & _FWRITE)==0) return -EINVAL;
+    if(flags & O_NONBLOCK) return -EWOULDBLOCK;
     if(seekPoint+static_cast<off_t>(len)<0)
         len=numeric_limits<off_t>::max()-seekPoint-len;
     ssize_t result=dev->writeBlock(data,len,seekPoint);
@@ -141,6 +150,8 @@ ssize_t DevFsFile::write(const void *data, size_t len)
 ssize_t DevFsFile::read(void *data, size_t len)
 {
     if((flags & _FREAD)==0) return -EINVAL;
+    size_t available = dev->peekSize(len);
+    if(available < len && (flags & O_NONBLOCK)) return -EAGAIN;
     if(seekPoint+static_cast<off_t>(len)<0)
         len=numeric_limits<off_t>::max()-seekPoint-len;
     ssize_t result=dev->readBlock(data,len,seekPoint);
@@ -179,6 +190,27 @@ int DevFsFile::fstat(struct stat *pstat) const
 int DevFsFile::isatty() const
 {
     return dev->isatty();
+}
+
+// FIXME: Guess-implementation of fcntl, to allow O_NONBLOCK
+int DevFsFile::fcntl(int cmd, int opt)
+{
+    switch(cmd)
+    {
+        case F_GETFD:
+        case F_GETFL: //TODO: also return file access mode
+            return O_RDWR;
+        case F_SETFL:
+            // Note: ignores all flags except O_NONBLOCK
+            // TODO: current implementation allows calling
+            // fcntl(fd, F_SETFL, O_NONBLOCK) to any DevFsFile but proper
+            // non-blocking is implemented exclusively for STM32Serial and
+            // Stm32DmaSerial, other classes are treated as non supporting
+            // non-blocking
+            flags = (flags & (~O_NONBLOCK)) | (opt & O_NONBLOCK);
+            return O_RDWR;
+    }
+    return -EBADF;
 }
 
 int DevFsFile::ioctl(int cmd, void *arg)
@@ -222,6 +254,10 @@ ssize_t Device::readBlock(void *buffer, size_t size, off_t where)
 ssize_t Device::writeBlock(const void *buffer, size_t size, off_t where)
 {
     return size; //Act as /dev/null
+}
+
+size_t Device::peekSize(size_t size) {
+    return size; //Act as /dev/zero: provides the number of requested bytes
 }
 
 void Device::IRQwrite(const char *str) {}

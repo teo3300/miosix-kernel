@@ -42,13 +42,13 @@
 #include <termios.h>
 #include <unistd.h>
 #include <interfaces/endianness.h>
-#include "interfaces/debugger.h"
+#include <interfaces/debugger.h>
+#include <fcntl.h>
 
-#ifdef LOGGING
-    #define dbg(...) fprintf(stdout, "[DBG]: " __VA_ARGS__)
-#else//LOGGING
-    #define dbg(...) do {} while (0)
-#endif//LOGGING
+//#define dbg(fmt, ...) iprintf("[DBG %4d]: " fmt, __LINE__,  __VA_ARGS__)
+#define dbg(...)
+
+#define sdbg(str) dbg("%s", str)
 
 namespace miosix {
 
@@ -71,14 +71,14 @@ int Debugger::needJoin = 0;
 
 // Accessory functions only used here: convert ascii 0-9,a-f to int
 // Only makes sense with characters 0-9 and a-f
-unsigned char asciiToHex(char character) {
+static inline unsigned char asciiToHex(char character) {
     return (character <= '9')
         ? character - '0'
         : character - 'a' + 0xa
         ;
 }
 
-char hexToAscii(unsigned char value) {
+static inline char hexToAscii(unsigned char value) {
     static const char * const asciiMap = "0123456789abcdef";
     return asciiMap[value & 0xf];
 }
@@ -188,7 +188,47 @@ void Debugger::listen(int serial) {
     // Unset debugger thread
     thread = nullptr;
 
-    dbg("failed\n");
+    sdbg("failed\n");
+}
+
+void Debugger::waitAttachedAndReply() {
+    // Set nonblocking read to allow Ctrl+C
+    // NOTE: Preserving flags (not necessary current implementation ignores all flags except O_NONBLOCK)
+    int flags = fcntl(serial, F_GETFL, 0);
+    if (flags == -1) { perror("fcntl get"); fail(); return; }
+    if (fcntl(serial, F_SETFL, flags | O_NONBLOCK) == -1) { perror("fcntl set"); fail(); return; }
+
+    sdbg("Waiting for event\n");
+
+    {
+        char cc;
+        FastGlobalIrqLock dLock;
+        // While process is not in debugstate (at least one thread running)
+        while(attached.debugState == false) {
+            Thread::IRQglobalIrqUnlockAndTimedWait(dLock, 5e8);
+            {   // Not very efficient locking and unlocking
+                FastGlobalIrqUnlock uLock(dLock);
+                int stat = read(serial, &cc, 1);
+                if(stat < 0 || cc != 0x03) continue;
+                FastGlobalIrqLock againLock;
+                // This function is called after the debugger requests an
+                // action (attach, continue and spawn)
+                // Spawn: PEND is already set, no need to set it
+                // In the other cases: set pend and force a debug event
+                // thread is already set to one of the threads of currently
+                // attached process (doesn't need to search for it again)
+                if(attached.debugState == false
+                && attached.thread != nullptr) continue;
+                attached.thread->debugStatus = DebugStatus::PEND;
+            }
+        }
+    }
+
+    // NOTE: as first fcntl
+    if (fcntl(serial, F_SETFL, flags) == -1) { perror("fcntl set"); fail(); return; }
+
+    // Must be outside of lock scope
+    stopReply();
 }
 
 void Debugger::listen(char serialName[]) {
@@ -217,25 +257,13 @@ void Debugger::recvPacket() {
         CHECKSUM_1
     } state = BEGIN;
 
-    // FSM:
-    // - ack on 0xf0 and 0x03 (reset and Ctrl-C)
-    // - discard any character until '$' is found (beginning of frame)
-    // - read until '#'
-    // - read checksumbytes and compare with message checksum, send ack and return/retry
     while(!failed) {
         if(read(serial, &cc, 1) < 0) {
             perror("read");
             fail();
             return;
         }
-
-        // Handle special characters
-        // if(cc == ((char) 0x03)) {
-        //     write(serial, "+", 1); continue;
-        // }
-        // if(cc == ((char) 0xf0)) {
-        //     write(serial, "+", 1); continue;
-        // }
+        // Ignore 0x03, handled in wait
 
         switch (state) {
         case BEGIN: {
@@ -364,12 +392,24 @@ void Debugger::stopReply() {
         BreakpointUnit::clear();
         // Report fault code (additional packet 'O', contains FaultID)
         buffer.clear();
+        // TODO: Too many functions
+        // Reporting 0xHH fault code and 0xHHHHHHHH program counter
+        // More detailed diagnostic would use FaultData::print
+        // But with character hex-encoding
         buffer.appendChar('O');
         buffer.appendBytes("Program fault has occurred: 0x");
         const auto c = attached.event.code;
-        const char retCode[] = {hexToAscii(c >> 4),
+        char retCode[9] = {hexToAscii(c >> 4),
                                 hexToAscii(c & 0xf),
                                 '\0'};
+        buffer.appendBytes(retCode);
+        buffer.appendBytes("\nProgram counter was: 0x");
+        // Swap endianess if needed
+        attached.event.pc = toBigEndian32(attached.event.pc);
+        for(unsigned int i = 0; i < 8; ++i) {
+            retCode[i] = hexToAscii((attached.event.pc >> (4*i)) & 0xf);
+        }
+        retCode[8] = '\0';
         buffer.appendBytes(retCode);
         sendPacket();
         {
@@ -431,7 +471,7 @@ void Debugger::handleCommand_gG() {
     }
 
     const auto read = buffer.getData()[0] == 'g';
-    char valPtr[MAX_REGISTER_SIZE_BYTES];
+    static char valPtr[MAX_REGISTER_SIZE_BYTES];
 
     if (read) {
         buffer.clear();
@@ -603,13 +643,44 @@ void Debugger::handleCommand_cs() {
         return;
     }
 
-    auto t = attached.thread;
+    char *readPtr = buffer.getData() + 1;
+    char *endPtr;
+    char valPtr[MAX_REGISTER_SIZE_BYTES];
+
+    // NOTE: Since it's used also in parsebigendian, maybe it should be implemented
+    // with dynamic methods, but here is a constant condition
+    // NOTE: This assumes existance of 64-bit architecture supported (not necessary
+    // const expr in if should be optimized out)
+    // Support optional argument for c and s packets 'c/s [resume address]'
+    if(BASE_REGISTER_SIZE_BYTES == 4) {
+        // arm32
+        const auto ptr = reinterpret_cast<unsigned int*>(valPtr);
+        *ptr = strtoul(readPtr, &endPtr, 16);
+        // NOTE: protocol doesn't specify if it's an address (big endianess) or PC
+        // register value (architecture endianess, similar to 'g')
+        // Assuming bigendian, not tested as GDB never uses the message and uses
+        // > Pf=<address> // Sets PC (0x)
+        // > c/s
+        // *ptr = toBigEndian32(*ptr);
+    } else {
+        // arm64
+        const auto ptr = reinterpret_cast<unsigned long long*>(valPtr);
+        *ptr = strtoull(readPtr, &endPtr, 16);
+        // *ptr = toBigEndian64(*ptr);
+    }
+    if ((endPtr > readPtr)
+    && (! RegisterFile::write(attached.thread, RegisterName::pc, valPtr)))
+    {
+        buffer.setReturnCode(GDBReturnCode::REGISTER_WRITE_FAIL);
+        return;
+    }
 
     const auto value = (buffer.getData()[0] == 'c')
                                  ? DebugStatus::RUN
                                  : DebugStatus::STEP
                                  ;
 
+    const auto t = attached.thread;
     {
         FastGlobalIrqLock dLock;
         // NOTE: It's mandatory to set stopreason to NONE as only the first thread
@@ -623,8 +694,7 @@ void Debugger::handleCommand_cs() {
         t->IRQdebugWakeup();
     }
 
-    waitAttached();
-    stopReply();
+    waitAttachedAndReply();
 }
 
 void Debugger::handleCommand_D() {
@@ -850,10 +920,10 @@ void Debugger::vrun() {
 
     // If process creation completes successfully: attached.process is set
     delete[] args;
+    sdbg("Spawn ok\n");
 
     // Process::create sets pending event for thread of created process
-    waitAttached();
-    stopReply();
+    waitAttachedAndReply();
 }
 
 void Debugger::vattach() {
@@ -933,8 +1003,7 @@ void Debugger::vattach() {
         }
     }
 
-    waitAttached();
-    stopReply();
+    waitAttachedAndReply();
 }
 
 // TODO: bad code
